@@ -1,260 +1,241 @@
-# app.py  — ARAM 대시보드 (CSV 자동 감지/대체 버전)
-# 사용 가능한 파일(있으면 사용, 없으면 건너뜀):
-# - champion_master.csv / champion_master_plus.csv
-# - champion_summary.csv, champion_base_stats.csv
-# - spell_summary.csv, item_summary.csv
-# - timeline_* (kills, first_deaths, first_towers, game_end, item_purchases, gold_diff)
+# app.py  — ARAM 대시보드 (CSV만 사용)
+# ---------------------------------------------------------
+# 깃허브 레포 루트에 올려둔 CSV들을 읽어 간단한 칼바람 통계 UI를 제공합니다.
+# 파일명:
+#  - champion_master.csv (있으면 최우선) 또는 champion_master_plus.csv
+#  - 없을 경우 champion_summary.csv + champion_base_stats.csv 를 병합해 사용
+#  - 보조: spell_summary.csv, item_summary.csv
+#  - 타임라인(있으면 자동 반영): timeline_kills.csv, timeline_item_purchases.csv
+#  - 원자료(있으면 일부 기능 강화): aram_participants_with_full_runes_merged.csv
+# ---------------------------------------------------------
 
-import os
-import numpy as np
+import os, io
+from typing import List, Tuple
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title="칼바람 대시보드", layout="wide")
+# ===================== UI 기본 스타일 =====================
+st.set_page_config(page_title="ARAM.gg (Prototype)", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Noto Sans KR', -apple-system, BlinkMacSystemFont, sans-serif; }
+.header{display:flex;align-items:center;gap:12px;margin:8px 0 16px}
+.title{font-size:1.6rem;font-weight:800}
+.section{font-weight:800;border-bottom:2px solid #f3f4f6;padding-bottom:6px;margin:14px 0 10px}
+.empty{color:#9ca3af;background:#f8fafc;border:1px dashed #e5e7eb;border-radius:12px;padding:18px 12px;text-align:center}
+</style>
+""", unsafe_allow_html=True)
+st.markdown('<div class="header"><div class="title">ARAM.gg — 칼바람 개인 프로젝트 대시보드</div></div>', unsafe_allow_html=True)
 
-# -------------------------------
-# 유틸
-# -------------------------------
-def exists(path: str) -> bool:
-    return os.path.exists(path)
-
-def list_if_has(cols, df):
-    return [c for c in cols if c in df.columns]
-
-def metric_if(col, row, fmt="{:.2f}", label=None):
-    if col in row.index and pd.notna(row[col]):
-        return (label or col), fmt.format(row[col])
-    return None
-
-@st.cache_data
-def read_csv_safe(path: str) -> pd.DataFrame:
-    return pd.read_csv(path)
-
-# -------------------------------
-# 데이터 로딩 (최대한 관대하게)
-# -------------------------------
-FILES = {
-    "master_plus": "champion_master_plus.csv",
-    "master":      "champion_master.csv",
-    "summary":     "champion_summary.csv",
-    "base":        "champion_base_stats.csv",
-    "spell":       "spell_summary.csv",
-    "item":        "item_summary.csv",
-    # 타임라인 (옵션)
-    "tl_kills":         "timeline_kills.csv",
-    "tl_first_deaths":  "timeline_first_deaths.csv",
-    "tl_first_towers":  "timeline_first_towers.csv",
-    "tl_game_end":      "timeline_game_end.csv",
-    "tl_item":          "timeline_item_purchases.csv",
-    "tl_gold":          "timeline_gold_diff.csv",
-}
-
-# 디버그용: 현재 폴더 파일 보여주기 (사이드바)
+# ===================== 사이드바 =====================
 with st.sidebar:
-    st.caption("📁 레포 루트 파일 목록")
-    try:
-        st.code("\n".join(sorted(os.listdir("."))[:200]), language="bash")
-    except Exception:
-        pass
+    if st.button("🔄 캐시/세션 초기화"):
+        try: st.cache_data.clear()
+        except: pass
+        try: st.cache_resource.clear()
+        except: pass
+        for k in list(st.session_state.keys()):
+            try: del st.session_state[k]
+            except: pass
+        st.rerun()
+    st.caption("이 앱은 로컬/레포 **CSV 파일**만 사용합니다 (Riot API 호출 없음).")
 
-# 1) 마스터 DF 선택: master_plus > master > (summary+base 합성)
-master_src = None
-df_master = None
+# ===================== 파일 로딩 유틸 =====================
+def exists(path: str) -> bool:
+    try: 
+        return os.path.exists(path)
+    except: 
+        return False
 
-if exists(FILES["master_plus"]):
-    df_master = read_csv_safe(FILES["master_plus"])
-    master_src = FILES["master_plus"]
-elif exists(FILES["master"]):
-    df_master = read_csv_safe(FILES["master"])
-    master_src = FILES["master"]
-elif exists(FILES["summary"]) and exists(FILES["base"]):
-    df_sum  = read_csv_safe(FILES["summary"])
-    df_base = read_csv_safe(FILES["base"])
-    df_master = df_sum.merge(df_base, on="champion", how="left")
-    # 기본 파생치 채우기
-    total_games = df_master["games"].sum() if "games" in df_master.columns else np.nan
-    if "pickrate" not in df_master.columns and "games" in df_master.columns and total_games > 0:
-        df_master["pickrate"] = (df_master["games"]/total_games*100).round(2)
-    if "kda" not in df_master.columns and set(["avg_kills","avg_deaths","avg_assists"]).issubset(df_master.columns):
-        df_master["kda"] = ((df_master["avg_kills"]+df_master["avg_assists"])
-                            / df_master["avg_deaths"].clip(lower=1)).round(2)
-    if "winrate" not in df_master.columns and set(["wins","games"]).issubset(df_master.columns):
-        df_master["winrate"] = (df_master["wins"]/df_master["games"]*100).round(2)
-    master_src = "summary+base(merged)"
-else:
-    st.error("❌ 핵심 CSV가 없습니다. 다음 중 하나가 필요합니다:\n"
-             "- champion_master_plus.csv\n- champion_master.csv\n- (champion_summary.csv + champion_base_stats.csv)")
+def load_master() -> pd.DataFrame:
+    """
+    1) champion_master.csv (또는 champion_master_plus.csv) 사용
+    2) 없으면 champion_summary.csv + champion_base_stats.csv 병합
+    반환: 최소한 ['champion','games','wins','winrate'] 가 있는 DF
+    """
+    cand = ["champion_master.csv", "champion_master_plus.csv"]
+    used = None
+    for f in cand:
+        if exists(f):
+            used = f
+            break
+
+    if used:
+        st.success(f"챔피언 마스터 테이블 사용: **{used}**")
+        df = pd.read_csv(used)
+        # 컬럼 최소 보정
+        cols = [c.lower() for c in df.columns]
+        # champion 컬럼명 보정
+        if "champion" not in df.columns:
+            # 혹시 'name' 등으로 저장된 경우
+            if "champion" not in cols and "name" in cols:
+                df = df.rename(columns={df.columns[cols.index("name")]: "champion"})
+        # winrate 없으면 계산
+        if {"wins","games"}.issubset(set(df.columns)) and "winrate" not in df.columns:
+            df["winrate"] = (df["wins"]/df["games"]*100).round(2)
+        return df
+
+    # fallback: summary + base
+    need = ["champion_summary.csv", "champion_base_stats.csv"]
+    if all(exists(f) for f in need):
+        st.warning("master csv 없음 → **summary + base** 병합하여 사용합니다.")
+        s = pd.read_csv("champion_summary.csv")
+        b = pd.read_csv("champion_base_stats.csv")
+        df = s.merge(b, on="champion", how="left")
+        if {"wins","games"}.issubset(df.columns) and "winrate" not in df.columns:
+            df["winrate"] = (df["wins"]/df["games"]*100).round(2)
+        return df
+
+    st.error("필수 CSV가 없습니다. (champion_master.csv 또는 summary+base 조합)")
     st.stop()
 
-# 정리
-df_master["champion"] = df_master["champion"].astype(str)
-if "winrate" in df_master.columns:
-    df_master["winrate"] = pd.to_numeric(df_master["winrate"], errors="coerce")
+@st.cache_data
+def load_all():
+    master = load_master()
 
-# 2) 서브 데이터(있으면 로드)
-def load_optional(name):
-    if exists(FILES[name]):
-        try:
-            return read_csv_safe(FILES[name])
-        except Exception:
-            return None
-    return None
+    spell = pd.read_csv("spell_summary.csv") if exists("spell_summary.csv") else pd.DataFrame()
+    item  = pd.read_csv("item_summary.csv")  if exists("item_summary.csv")  else pd.DataFrame()
 
-df_spell = load_optional("spell")
-df_item  = load_optional("item")
-df_tlk   = load_optional("tl_kills")
-df_tld   = load_optional("tl_first_deaths")
-df_tlt   = load_optional("tl_first_towers")
-df_tle   = load_optional("tl_game_end")
-df_tli   = load_optional("tl_item")
-df_tlg   = load_optional("tl_gold")
+    tl_kill = pd.read_csv("timeline_kills.csv") if exists("timeline_kills.csv") else pd.DataFrame()
+    tl_buy  = pd.read_csv("timeline_item_purchases.csv") if exists("timeline_item_purchases.csv") else pd.DataFrame()
 
-# -------------------------------
-# UI — 탭 구성
-# -------------------------------
-st.title("칼바람 챔피언 대시보드")
-st.caption(f"데이터 소스: **{master_src}**  |  CSV 기반으로 구동")
+    raw = pd.read_csv("aram_participants_with_full_runes_merged.csv") if exists("aram_participants_with_full_runes_merged.csv") else pd.DataFrame()
 
-tab_overview, tab_champ, tab_tables = st.tabs(["📊 개요", "🧩 챔피언 상세", "📄 테이블/다운로드"])
+    return master, spell, item, tl_kill, tl_buy, raw
 
-# -------------------------------
-# 탭 1: 개요
-# -------------------------------
+master, spell_summary, item_summary, tl_kills, tl_purchases, raw = load_all()
+
+# ===================== 헬퍼: 다운로드 버튼 =====================
+def df_download_button(df: pd.DataFrame, label="CSV 다운로드", filename="data.csv"):
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, encoding="utf-8-sig")
+    st.download_button(label, buf.getvalue().encode("utf-8-sig"), file_name=filename, mime="text/csv")
+
+# ===================== 상단: 개요 =====================
+st.markdown('<div class="section">📊 개요</div>', unsafe_allow_html=True)
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("챔피언 수", f"{master['champion'].nunique():,}")
+if "games" in master.columns:
+    c2.metric("총 경기 수(표본)", f"{int(master['games'].sum()):,}")
+else:
+    c2.metric("총 경기 수(표본)", "-")
+if "wins" in master.columns and "games" in master.columns:
+    wr = (master["wins"].sum() / master["games"].sum() * 100) if master["games"].sum() else 0
+    c3.metric("전체 승률", f"{wr:.2f}%")
+else:
+    c3.metric("전체 승률", "-")
+c4.metric("타임라인(킬) 레코드", f"{len(tl_kills):,}" if not tl_kills.empty else "0")
+
+# ===================== 탭 =====================
+tab_overview, tab_spell, tab_item, tab_timeline, tab_raw = st.tabs(
+    ["챔피언 성과", "스펠 요약", "아이템 요약", "타임라인 분석", "원자료/룬"]
+)
+
+# ---------- 챔피언 성과 ----------
 with tab_overview:
-    # 상단 KPI
-    total_games = int(df_master["games"].sum()) if "games" in df_master.columns else None
-    avg_wr = df_master["winrate"].mean() if "winrate" in df_master.columns else None
-    cols = st.columns(4)
-    cols[0].metric("챔피언 수", f"{df_master['champion'].nunique():,}")
-    if total_games: cols[1].metric("총 게임수(표본)", f"{total_games:,}")
-    if avg_wr: cols[2].metric("평균 승률", f"{avg_wr:.2f}%")
-    if "pickrate" in df_master.columns:
-        cols[3].metric("평균 픽률", f"{df_master['pickrate'].mean():.2f}%")
+    st.subheader("챔피언별 승률/피해/골드 요약")
 
-    st.divider()
+    # 가벼운 필터
+    champs = sorted(master["champion"].unique().tolist())
+    pick = st.multiselect("챔피언 필터", champs, default=[])
 
-    # 승률 TOP10
-    if "winrate" in df_master.columns:
-        st.subheader("승률 TOP 10")
-        top10 = df_master.dropna(subset=["winrate"]).sort_values("winrate", ascending=False).head(10)
-        if not top10.empty:
-            fig = px.bar(top10, x="champion", y="winrate", text="winrate", height=380)
-            fig.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
+    dfv = master.copy()
+    if pick:
+        dfv = dfv[dfv["champion"].isin(pick)]
+
+    # 표시는 꼭 존재하는 컬럼만
+    show_cols = [c for c in ["champion","games","wins","winrate","avg_kills","avg_deaths","avg_assists","avg_damage","avg_gold"] if c in dfv.columns]
+    if not show_cols:
+        st.warning("표시할 요약 컬럼이 없습니다. master CSV 컬럼을 확인하세요.")
+    else:
+        st.dataframe(dfv[show_cols].sort_values("winrate", ascending=False), use_container_width=True, height=480)
+        df_download_button(dfv[show_cols], "표시 데이터 다운로드", "champion_overview.csv")
+
+    # 간단한 차트 (winrate / games)
+    cc1, cc2 = st.columns(2)
+    if {"champion","winrate"}.issubset(dfv.columns):
+        fig = px.bar(dfv.sort_values("winrate", ascending=False).head(20),
+                     x="champion", y="winrate", title="상위 승률(Top20)")
+        fig.update_layout(height=360)
+        cc1.plotly_chart(fig, use_container_width=True)
+    if {"champion","games"}.issubset(dfv.columns):
+        fig = px.bar(dfv.sort_values("games", ascending=False).head(20),
+                     x="champion", y="games", title="등장 경기수(Top20)")
+        fig.update_layout(height=360)
+        cc2.plotly_chart(fig, use_container_width=True)
+
+# ---------- 스펠 요약 ----------
+with tab_spell:
+    st.subheader("스펠 조합 성과 요약")
+    if spell_summary.empty:
+        st.markdown('<div class="empty">spell_summary.csv 가 없습니다.</div>', unsafe_allow_html=True)
+    else:
+        st.dataframe(spell_summary.sort_values("games", ascending=False), use_container_width=True, height=480)
+        df_download_button(spell_summary, "CSV 다운로드", "spell_summary.csv")
+
+# ---------- 아이템 요약 ----------
+with tab_item:
+    st.subheader("아이템 성과 요약")
+    if item_summary.empty:
+        st.markdown('<div class="empty">item_summary.csv 가 없습니다.</div>', unsafe_allow_html=True)
+    else:
+        st.dataframe(item_summary.sort_values("games", ascending=False), use_container_width=True, height=480)
+        df_download_button(item_summary, "CSV 다운로드", "item_summary.csv")
+
+        # 상위 아이템 승률 차트
+        if {"item","winrate"}.issubset(item_summary.columns):
+            fig = px.bar(item_summary.sort_values("games", ascending=False).head(30),
+                         x="item", y="winrate", title="아이템 승률 (Top30 by games)")
+            fig.update_layout(height=360)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.caption("승률 데이터가 부족합니다.")
 
-    # 픽률 TOP10
-    if "pickrate" in df_master.columns:
-        st.subheader("픽률 TOP 10")
-        top10p = df_master.dropna(subset=["pickrate"]).sort_values("pickrate", ascending=False).head(10)
-        fig = px.bar(top10p, x="champion", y="pickrate", text="pickrate", height=360)
-        fig.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
-        st.plotly_chart(fig, use_container_width=True)
+# ---------- 타임라인 ----------
+with tab_timeline:
+    st.subheader("타임라인 기반 간단 분석")
+    if tl_kills.empty and tl_purchases.empty:
+        st.markdown('<div class="empty">timeline_kills.csv / timeline_item_purchases.csv 가 없습니다.</div>', unsafe_allow_html=True)
+    else:
+        if not tl_kills.empty:
+            st.markdown("**킬 타임라인**")
+            # minute 기준 히스토그램 (0.5분 bin)
+            t = tl_kills.copy()
+            if "minute" in t.columns:
+                fig = px.histogram(t, x="minute", nbins=40, title="킬 발생 분포")
+                fig.update_layout(height=320)
+                st.plotly_chart(fig, use_container_width=True)
 
-# -------------------------------
-# 탭 2: 챔피언 상세
-# -------------------------------
-with tab_champ:
-    champs = sorted(df_master["champion"].unique())
-    c1, c2 = st.columns([1.2, 2])
-    sel = c1.selectbox("챔피언 선택", champs, index=0)
-    row = df_master[df_master["champion"] == sel].iloc[0]
+        if not tl_purchases.empty:
+            st.markdown("**아이템 구매 타임라인 (초기 5분)**")
+            p = tl_purchases.copy()
+            p = p[p["minute"] <= 5] if "minute" in p.columns else p.head(0)
+            if not p.empty and {"minute","itemName"}.issubset(p.columns):
+                # 자주 산 시작 아이템 상위
+                top = (p.groupby("itemName").size().reset_index(name="cnt")
+                       .sort_values("cnt", ascending=False).head(15))
+                st.dataframe(top, use_container_width=True)
 
-    # KPI 보드
-    k = st.columns(6)
-    if "winrate" in row.index: k[0].metric("승률", f"{row['winrate']:.2f}%")
-    if "pickrate" in row.index and pd.notna(row["pickrate"]): k[1].metric("픽률", f"{row['pickrate']:.2f}%")
-    if "games" in row.index: k[2].metric("게임수", f"{int(row['games']):,}")
-    if "kda" in row.index and pd.notna(row["kda"]): k[3].metric("KDA", f"{row['kda']:.2f}")
-    if "avg_dpm" in row.index and pd.notna(row["avg_dpm"]): k[4].metric("DPM", f"{row['avg_dpm']:.0f}")
-    if "avg_gpm" in row.index and pd.notna(row['avg_gpm']): k[5].metric("GPM", f"{row['avg_gpm']:.0f}")
+# ---------- 원자료/룬 ----------
+with tab_raw:
+    st.subheader("원자료 + 룬 요약(있을 때)")
+    if raw.empty:
+        st.markdown('<div class="empty">aram_participants_with_full_runes_merged.csv 가 없습니다.</div>', unsafe_allow_html=True)
+    else:
+        # 챔피언/핵심룬 기준 요약
+        if {"champion","rune_core"}.issubset(raw.columns):
+            rsum = (raw.groupby(["champion","rune_core"])
+                      .agg(games=("matchId","count"),
+                           wins=("win","sum"))
+                      .reset_index())
+            rsum["winrate"] = (rsum["wins"]/rsum["games"]*100).round(2)
+            st.markdown("**챔피언 × 핵심룬 요약**")
+            st.dataframe(rsum.sort_values(["champion","games"], ascending=[True,False]),
+                         use_container_width=True, height=420)
+            df_download_button(rsum, "룬 요약 CSV", "runes_by_champion.csv")
 
-    # 메타 변화(있으면)
-    if "delta_winrate" in row.index and pd.notna(row["delta_winrate"]):
-        st.info(f"📈 최근 승률 변화: {row['delta_winrate']:+.2f}%p")
-
-    # 좌/우
-    left, right = st.columns([1.1, 1])
-
-    with left:
-        st.subheader("추천 빌드 / 룬 / 스펠 (있을 때만 표시)")
-        fields = [
-            ("best_rune", "추천 룬"),
-            ("best_spell_combo", "추천 스펠"),
-            ("best_start", "시작템"),
-            ("best_boots", "신발"),
-            ("best_core3", "코어 3"),
-            ("synergy_top1", "같이하면 좋은 챔피언"),
-            ("enemy_hard_top1", "상대하기 어려운 챔피언")
-        ]
-        for col, label in fields:
-            if col in row.index and isinstance(row[col], (str, int, float)) and str(row[col]).strip():
-                st.markdown(f"- **{label}**: {row[col]}")
-
-        # 기본 스탯(있으면)
-        base_cols = [
-            ("체력", "hp"), ("레벨당 체력", "hpperlevel"),
-            ("마나", "mp"), ("레벨당 마나", "mpperlevel"),
-            ("방어력", "armor"), ("레벨당 방어력", "armorperlevel"),
-            ("마법저항", "spellblock"), ("레벨당 마저", "spellblockperlevel"),
-            ("공격력", "attackdamage"), ("레벨당 공격력", "attackdamageperlevel"),
-            ("공속", "attackspeed"), ("레벨당 공속", "attackspeedperlevel"),
-            ("이동속도", "movespeed"), ("사거리", "attackrange"),
-        ]
-        st.subheader("기본 스탯")
-        cols = st.columns(5)
-        i=0
-        for label, key in base_cols:
-            if key in row.index and pd.notna(row[key]):
-                cols[i%5].metric(label, f"{row[key]:.2f}")
-                i+=1
-
-    with right:
-        st.subheader("페이즈별 DPM (있을 때만)")
-        if any(c in df_master.columns for c in ["dpm_early","dpm_mid","dpm_late"]):
-            plot_df = pd.DataFrame({
-                "phase": ["0–8분","8–16분","16+분"],
-                "dpm": [
-                    row.get("dpm_early", np.nan),
-                    row.get("dpm_mid", np.nan),
-                    row.get("dpm_late", np.nan),
-                ]
-            })
-            fig = px.bar(plot_df, x="phase", y="dpm", text="dpm", height=300)
-            fig.update_traces(texttemplate="%{text:.0f}", textposition="outside")
-            fig.update_layout(yaxis_title=None, xaxis_title=None, margin=dict(t=10,b=10,l=10,r=10))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.caption("페이즈별 DPM 컬럼이 없습니다.")
-
-# -------------------------------
-# 탭 3: 테이블 & 다운로드
-# -------------------------------
-with tab_tables:
-    st.subheader("원본/요약 테이블")
-
-    def show_tbl(name, df):
-        if df is None or df.empty:
-            st.warning(f"{name} 없음")
-            return
-        st.markdown(f"#### {name}")
-        st.dataframe(df, use_container_width=True, height=320)
-        csv = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(f"⬇️ {name} 다운로드", data=csv, file_name=f"{name}.csv", mime="text/csv")
-
-    show_tbl("champion_master(표시 중)", df_master)
-
-    show_tbl("spell_summary", df_spell)
-    show_tbl("item_summary",  df_item)
-
-    show_tbl("timeline_kills",         df_tlk)
-    show_tbl("timeline_first_deaths",  df_tld)
-    show_tbl("timeline_first_towers",  df_tlt)
-    show_tbl("timeline_game_end",      df_tle)
-    show_tbl("timeline_item_purchases",df_tli)
-    show_tbl("timeline_gold_diff",     df_tlg)
-
-st.caption("© ARAM 대시보드 — 레포의 CSV만 바꿔도 자동 반영됩니다.")
-
+        # 원자료 미리보기(가벼운 컬럼)
+        show_cols = [c for c in ["matchId","summonerName","champion","teamId","win","kills","assists","deaths","gold",
+                                 "spell1","spell2","rune_core","rune_sub"] if c in raw.columns]
+        st.markdown("**원자료 미리보기**")
+        st.dataframe(raw[show_cols].head(500), use_container_width=True, height=360)
